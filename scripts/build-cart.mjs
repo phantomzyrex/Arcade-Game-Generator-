@@ -240,6 +240,8 @@ for (const engineFile of ["cart.d.ts", "runtime.js", "headless.mjs"]) {
   }
 }
 
+import crypto from "node:crypto";
+
 const gamesDir = path.join(rootDir, "engine", "games");
 if (fs.existsSync(gamesDir)) {
   for (const file of fs.readdirSync(gamesDir)) {
@@ -250,6 +252,73 @@ if (fs.existsSync(gamesDir)) {
       fs.copyFileSync(srcFile, path.join(wsGamesDir, file));
     }
   }
+}
+
+// Pre-bundle gamesmith agent sources into server/gamesmith-bundle.json for serverless (Vercel) compatibility
+try {
+  const readRepoFile = (relPath) => fs.readFileSync(path.join(rootDir, relPath), "utf8");
+  const systemInstruction = readRepoFile("agents/gamesmith/SYSTEM.md");
+  const agentsMdContent = readRepoFile("agent/.agents/AGENTS.md");
+  const engineFiles = [
+    "engine/cart.d.ts",
+    "engine/runtime.js",
+    "engine/headless.mjs",
+    "engine/games/dodger.js",
+    "engine/games/runner.js",
+    "engine/games/shooter.js",
+    "engine/games/maze.js",
+    "engine/games/breakout.js",
+    "engine/games/platformer.js",
+  ];
+  const agentKitFiles = [
+    {
+      repo: "agent/.agents/skills/pixel-game-from-card/SKILL.md",
+      target: ".agents/skills/pixel-game-from-card/SKILL.md",
+    },
+    {
+      repo: "agent/.agents/skills/playtest/SKILL.md",
+      target: ".agents/skills/playtest/SKILL.md",
+    },
+    {
+      repo: "agent/.agents/skills/pixel-art-sprites/SKILL.md",
+      target: ".agents/skills/pixel-art-sprites/SKILL.md",
+    },
+  ];
+  const inlineSource = (target, content) => ({
+    type: "inline",
+    target,
+    content,
+  });
+  const sources = [
+    inlineSource(".agents/AGENTS.md", agentsMdContent),
+    ...agentKitFiles.map((f) => inlineSource(f.target, readRepoFile(f.repo))),
+    ...engineFiles.map((rel) => inlineSource(`workspace/${rel}`, readRepoFile(rel))),
+  ];
+  const baseAgentId = process.env.AGENT_ID || "antigravity-preview-09-2026";
+  const model = process.env.GAMESMITH_MODEL || "gemini-4-argon";
+  const maxTokens = 400_000;
+  const bundleHash = crypto
+    .createHash("sha256")
+    .update(
+      JSON.stringify({
+        baseAgent: baseAgentId,
+        model,
+        maxTokens,
+        systemInstruction,
+        sources,
+      })
+    )
+    .digest("hex")
+    .slice(0, 12);
+  const description = `playglow PICO-8 arcade cartridge generator (gamesmith) [hash:${bundleHash}]`;
+  const bundleOutPath = path.join(rootDir, "server", "gamesmith-bundle.json");
+  fs.writeFileSync(
+    bundleOutPath,
+    JSON.stringify({ bundleHash, description, systemInstruction, sources }, null, 2),
+    "utf8"
+  );
+} catch (err) {
+  console.warn("[build-cart] Warning generating server/gamesmith-bundle.json:", err?.message || err);
 }
 
 console.log(

@@ -1,18 +1,10 @@
 import "dotenv/config";
 import express from "express";
-import cors from "cors";
 import path from "node:path";
 import fs from "node:fs";
 import { execFileSync } from "node:child_process";
-import {
-  createGeminiProxyRouter,
-  resetAllCaps,
-  resetProbeCaps,
-  isSelftestContext,
-  getEffectiveAdminToken,
-  getServerApiKey,
-  ensureGamesmithBaked,
-} from "./gemini-proxy";
+import { createApiApp } from "./app";
+import { ensureGamesmithBaked } from "./gemini-proxy";
 
 const rootDir = process.cwd();
 
@@ -30,6 +22,7 @@ function parseCliArg(flag: string): string | undefined {
 }
 
 function ensureCartHostBuilt(): void {
+  if (process.env.VERCEL) return;
   const hostHtmlPath = path.join(rootDir, "public", "cart", "host.html");
   const buildCartScript = path.join(rootDir, "scripts", "build-cart.mjs");
   if (!fs.existsSync(hostHtmlPath) && fs.existsSync(buildCartScript)) {
@@ -44,76 +37,7 @@ function ensureCartHostBuilt(): void {
 async function startServer(): Promise<void> {
   ensureCartHostBuilt();
 
-  const app = express();
-  app.use(cors());
-
-  app.get("/api/healthz", (_req, res) => {
-    res.json({
-      ok: true,
-      hasServerApiKey: Boolean(getServerApiKey()),
-    });
-  });
-
-  // Admin endpoint to reset rate-limit counters (used by ?selftest Check 9)
-  app.post("/api/admin/reset-caps", (req, res) => {
-    const adminToken = getEffectiveAdminToken();
-    const provided = req.headers["x-admin-token"];
-    const validAdmin = Boolean(adminToken && provided === adminToken);
-    const isAiStudioDev =
-      process.env.NODE_ENV !== "production" ||
-      process.env.DISABLE_HMR === "true" ||
-      Boolean(process.env.K_SERVICE);
-
-    if (validAdmin || isAiStudioDev) {
-      resetAllCaps();
-      res.json({ ok: true });
-      return;
-    }
-
-    if (isSelftestContext(req)) {
-      resetProbeCaps();
-      res.json({ ok: true, probeOnly: true });
-      return;
-    }
-
-    res.status(401).json({ error: { message: "Unauthorized: invalid or missing x-admin-token" } });
-  });
-
-  // Selftest helper endpoint: provides ADMIN_TOKEN only when running on local loopback, in AI Studio dev container during ?selftest, or when ALLOW_REMOTE_SELFTEST=true
-  app.get("/api/admin/selftest-token", (req, res) => {
-    const host = req.headers.host || "";
-    const hasForwardedFor = Boolean(req.headers["x-forwarded-for"] || req.headers["x-forwarded-host"]);
-    const isLocalHostHeader =
-      host === "localhost" ||
-      host.startsWith("localhost:") ||
-      host === "127.0.0.1" ||
-      host.startsWith("127.0.0.1:");
-    const isStrictLocalDev =
-      !hasForwardedFor &&
-      isLocalHostHeader &&
-      process.env.NODE_ENV !== "production" &&
-      (req.ip === "127.0.0.1" || req.ip === "::1" || req.ip === "::ffff:127.0.0.1");
-
-    const isAiStudioSelftest =
-      (process.env.NODE_ENV !== "production" ||
-        process.env.DISABLE_HMR === "true" ||
-        Boolean(process.env.K_SERVICE)) &&
-      isSelftestContext(req);
-
-    const allowRemoteSelftest = process.env.ALLOW_REMOTE_SELFTEST === "true";
-
-    const adminToken = getEffectiveAdminToken();
-    const validHeader = Boolean(adminToken) && req.headers["x-admin-token"] === adminToken;
-
-    if (!isStrictLocalDev && !isAiStudioSelftest && !allowRemoteSelftest && !validHeader) {
-      res.status(403).json({ error: { message: "Forbidden" } });
-      return;
-    }
-    res.json({ adminToken });
-  });
-
-  // Mount Gemini proxy at /api/gemini BEFORE static / Vite middleware
-  app.use("/api/gemini", createGeminiProxyRouter());
+  const app = createApiApp();
 
   const distDir = path.join(rootDir, "dist");
   const distIndexHtml = path.join(distDir, "index.html");

@@ -5,7 +5,14 @@ import fs from "node:fs";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { CONFIG } from "../src/config";
-import { BASE_AGENT } from "../src/vendor/managed-agents.js";
+import {
+  BASE_AGENT,
+  DEFAULT_MODEL,
+  ManagedAgents,
+  codeExecution,
+  type InlineSource,
+} from "../src/vendor/managed-agents.js";
+import gamesmithBundle from "./gamesmith-bundle.json";
 
 const rootDir = process.cwd();
 
@@ -73,38 +80,116 @@ export function invalidateGamesmithBakeCache(): void {
   activeBakePromise = null;
 }
 
+async function runInProcessBake(apiKey: string): Promise<void> {
+  const agentId = process.env.GAMESMITH_AGENT || CONFIG.GAMESMITH_AGENT || "gamesmith-v1";
+  const baseAgentId = process.env.AGENT_ID || BASE_AGENT;
+  const model = process.env.GAMESMITH_MODEL || DEFAULT_MODEL;
+  const maxTokens = CONFIG.MAX_AGENT_TOKENS || 400_000;
+
+  const { bundleHash, description, systemInstruction, sources } = gamesmithBundle as {
+    bundleHash: string;
+    description: string;
+    systemInstruction: string;
+    sources: InlineSource[];
+  };
+
+  const ma = new ManagedAgents({
+    apiKey,
+    baseUrl: process.env.GEMINI_UPSTREAM || undefined,
+  });
+
+  try {
+    const existing: any = await ma.agents.get(agentId);
+    if (
+      existing &&
+      (existing.id || existing.name) &&
+      String(existing.description || "").includes(`[hash:${bundleHash}]`) &&
+      String(existing.base_agent || "").includes(baseAgentId)
+    ) {
+      return;
+    }
+  } catch (err: any) {
+    if (err?.status !== 404) {
+      console.warn(`[playglow-server] Warning checking existing '${agentId}':`, err?.message || err);
+    }
+  }
+
+  const candidateBaseAgents = Array.from(new Set([baseAgentId, "antigravity-preview-09-2026"]));
+  const candidateModels = Array.from(new Set([model, "gemini-4-argon", "gemini-3.8-flash"]));
+
+  let created: any = null;
+  let lastErr: any = null;
+  for (const candidateBase of candidateBaseAgents) {
+    if (created) break;
+    for (const candidateModel of candidateModels) {
+      try {
+        created = await ma.agents.replace(agentId, {
+          baseAgent: candidateBase,
+          description,
+          model: candidateModel,
+          maxTokens,
+          tools: [codeExecution()],
+          network: "disabled",
+          systemInstruction,
+          sources,
+        });
+        break;
+      } catch (err: any) {
+        lastErr = err;
+        const msg = String(err?.message || err);
+        if (/\bagent\b/i.test(msg) && !/\bmodel\b/i.test(msg)) {
+          break;
+        }
+      }
+    }
+  }
+
+  if (!created) {
+    throw lastErr || new Error(`Failed to bake agent ${agentId}`);
+  }
+}
+
 export function ensureGamesmithBaked(apiKey?: string): Promise<void> {
   const key = apiKey || getServerApiKey();
   if (!key) return Promise.resolve();
   if ((bakedForApiKey === key || inFlightBakeKey === key) && activeBakePromise) {
     return activeBakePromise;
   }
-  const bakeScript = path.join(rootDir, "scripts", "bake-agent.mjs");
-  if (!fs.existsSync(bakeScript)) {
-    return Promise.resolve();
-  }
   inFlightBakeKey = key;
-  activeBakePromise = new Promise<void>((resolve) => {
-    execFile(
-      process.execPath,
-      [bakeScript, "--if-missing"],
-      { cwd: rootDir, env: { ...process.env, GEMINI_API_KEY: key } },
-      (err, stdout) => {
-        inFlightBakeKey = null;
-        if (err) {
-          console.warn("[playglow-server] background bake-agent check warning:", err.message);
-          bakedForApiKey = null;
-          activeBakePromise = null;
-        } else {
-          bakedForApiKey = key;
-          if (stdout) {
-            console.log("[playglow-server] gamesmith-v1 ready on active project key");
-          }
-        }
-        resolve();
+  activeBakePromise = (async () => {
+    try {
+      await runInProcessBake(key);
+      bakedForApiKey = key;
+    } catch (inProcErr: any) {
+      // Fallback to scripts/bake-agent.mjs if available on local filesystem
+      const bakeScript = path.join(rootDir, "scripts", "bake-agent.mjs");
+      if (fs.existsSync(bakeScript) && !process.env.VERCEL) {
+        await new Promise<void>((resolve) => {
+          execFile(
+            process.execPath,
+            [bakeScript, "--if-missing"],
+            { cwd: rootDir, env: { ...process.env, GEMINI_API_KEY: key } },
+            (err) => {
+              if (err) {
+                console.warn("[playglow-server] bake-agent warning:", err.message);
+                bakedForApiKey = null;
+                activeBakePromise = null;
+              } else {
+                bakedForApiKey = key;
+              }
+              resolve();
+            }
+          );
+        });
+      } else {
+        console.warn("[playglow-server] in-process bake-agent warning:", inProcErr?.message || inProcErr);
+        bakedForApiKey = null;
+        activeBakePromise = null;
       }
-    );
-  });
+    } finally {
+      inFlightBakeKey = null;
+    }
+  })();
   return activeBakePromise;
 }
 
@@ -444,9 +529,21 @@ export function createGeminiProxyRouter(): Router {
     const now = Date.now();
     pruneHub(now);
 
-    const subPath = req.path.startsWith("/") ? req.path : `/${req.path}`;
-    const v1Match = subPath.match(/\/v1beta\/.*$/);
-    const v1Path = v1Match ? v1Match[0] : subPath;
+    // Normalize req.body into a Buffer in case the serverless host (e.g. Vercel) pre-parsed JSON/text
+    if (req.body !== undefined && req.body !== null && !Buffer.isBuffer(req.body)) {
+      if (typeof req.body === "string") {
+        req.body = Buffer.from(req.body, "utf8");
+      } else if (req.body instanceof Uint8Array) {
+        req.body = Buffer.from(req.body);
+      } else if (typeof req.body === "object" && Object.keys(req.body).length > 0) {
+        req.body = Buffer.from(JSON.stringify(req.body), "utf8");
+      }
+    }
+
+    const rawPath = req.path.startsWith("/") ? req.path : `/${req.path}`;
+    const v1Match = (req.originalUrl || rawPath).match(/\/v1beta\/[^?]*/);
+    const v1Path = v1Match ? v1Match[0] : rawPath;
+    const subPath = v1Path;
 
     const allowCheck = checkAllowedPath(req, v1Path);
     if (!allowCheck.ok) {
@@ -460,7 +557,8 @@ export function createGeminiProxyRouter(): Router {
     const isAiStudioDev =
       (process.env.NODE_ENV !== "production" ||
         process.env.DISABLE_HMR === "true" ||
-        Boolean(process.env.K_SERVICE)) &&
+        Boolean(process.env.K_SERVICE) ||
+        Boolean(process.env.VERCEL)) &&
       !isProbe;
 
     const capBuildsPerIp = isAiStudioDev
