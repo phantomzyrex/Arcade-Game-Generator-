@@ -19,8 +19,8 @@ import {
   BuildSession,
   loadHouseGameSource,
   type BuildSnapshot,
-} from "./build/buildSession";
-import { runSkinSession, type SkinImageKind } from "./build/skinSession";
+} from "./sessions/buildSession";
+import { runSkinSession, type SkinImageKind } from "./sessions/skinSession";
 import {
   loadGameLibrary,
   saveVisitorGame,

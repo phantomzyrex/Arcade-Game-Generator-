@@ -4,7 +4,7 @@ import { buildPresetCard } from "../card/designCard";
 import type { GenreName } from "../card/presets";
 import type { VibeName } from "../card/vibes";
 import { CONFIG } from "../config";
-import { loadHouseGameSource } from "../build/buildSession";
+import { loadHouseGameSource } from "../sessions/buildSession";
 import {
   HOUSE_GAME_SPECS,
   getMockGameSkin,
